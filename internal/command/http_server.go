@@ -6,8 +6,10 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/gozix/di"
@@ -40,10 +42,9 @@ func NewHTTPServer(ctn di.Container) *cobra.Command {
 				var wg, ctx = errgroup.WithContext(cmd.Context())
 
 				for _, srvName := range serverNames {
-					var srvName = srvName
-					wg.Go(func() (err error) {
+					wg.Go(func() error {
 						var e *echo.Echo
-						if err = ctn.Resolve(&e, di.WithTags(tagEcho+"."+srvName)); err != nil {
+						if err := ctn.Resolve(&e, di.WithTags(tagEcho+"."+srvName)); err != nil {
 							return err
 						}
 
@@ -59,27 +60,7 @@ func NewHTTPServer(ctn di.Container) *cobra.Command {
 							)
 						)
 
-						log.Info("Starting HTTP server")
-
-						go func() {
-							if err = e.Start(addr); err != nil {
-								log.Info("Gracefully shutting down the HTTP server")
-							}
-						}()
-
-						log.Info("HTTP server started")
-
-						// wait, context cancellation
-						<-ctx.Done()
-
-						// graceful shutdown
-						var timeout = 10 * time.Second
-						log.Info("Stopping HTTP server", zap.Duration("timeout", timeout))
-
-						var timeoutContext, cancel = context.WithTimeout(context.Background(), timeout)
-						defer cancel()
-
-						return e.Shutdown(timeoutContext)
+						return runServer(ctx, e, addr, log)
 					})
 				}
 
@@ -87,4 +68,53 @@ func NewHTTPServer(ctn di.Container) *cobra.Command {
 			}, di.Constraint(0, modServers.Modifier()))
 		},
 	}
+}
+
+// runServer starts the server and gracefully shuts it down on context cancellation.
+//
+// The start result travels through a channel instead of a shared variable, so the goroutine running
+// the server and the one shutting it down never write to the same memory.
+func runServer(ctx context.Context, e *echo.Echo, addr string, log *zap.Logger) error {
+	log.Info("Starting HTTP server")
+
+	var errCh = make(chan error, 1)
+	go func() {
+		var err = e.Start(addr)
+		if err != nil {
+			log.Info("Gracefully shutting down the HTTP server")
+		}
+
+		errCh <- err
+	}()
+
+	log.Info("HTTP server started")
+
+	// wait, either an early start failure or a context cancellation
+	select {
+	case err := <-errCh:
+		// a closed server is an expected outcome, not a failure
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+
+		return err
+	case <-ctx.Done():
+	}
+
+	// graceful shutdown
+	var timeout = 10 * time.Second
+	log.Info("Stopping HTTP server", zap.Duration("timeout", timeout))
+
+	var timeoutContext, cancel = context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var shutdownErr = e.Shutdown(timeoutContext)
+
+	// join the serving goroutine, so it neither logs nor leaks after the command returns.
+	// Shutdown closes the listener, so Start has already returned by now.
+	if err := <-errCh; shutdownErr == nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+
+	return shutdownErr
 }
