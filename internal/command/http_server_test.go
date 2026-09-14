@@ -20,18 +20,18 @@ import (
 // and without reporting the shutdown itself as an error. Run it with -race.
 func TestRunServerGracefulShutdown(t *testing.T) {
 	var (
-		e           = echo.New()
+		e           = newTestEcho()
 		ctx, cancel = context.WithCancel(context.Background())
 		done        = make(chan error, 1)
 	)
 
-	defer cancel()
+	t.Cleanup(cancel)
 
 	go func() {
 		done <- runServer(ctx, e, "127.0.0.1:0", zap.NewNop())
 	}()
 
-	waitServing(t, e)
+	var addr = requireServing(t, e)
 	cancel()
 
 	select {
@@ -40,6 +40,11 @@ func TestRunServerGracefulShutdown(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("runServer did not return after the context cancellation")
 	}
+
+	// the address is free again, so the server is really down and not just reported as such
+	var listener, err = net.Listen("tcp", addr)
+	require.NoError(t, err)
+	require.NoError(t, listener.Close())
 }
 
 // TestRunServerStartError ensures a failed start is reported as is and does not wait for the context.
@@ -47,38 +52,51 @@ func TestRunServerStartError(t *testing.T) {
 	var busy, err = net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	defer func() {
-		require.NoError(t, busy.Close())
-	}()
+	t.Cleanup(func() {
+		_ = busy.Close()
+	})
 
-	var (
-		e    = echo.New()
-		done = make(chan error, 1)
-	)
+	var done = make(chan error, 1)
 
 	// the context is never cancelled, so only an early return can unblock the test
 	go func() {
-		done <- runServer(context.Background(), e, busy.Addr().String(), zap.NewNop())
+		done <- runServer(context.Background(), newTestEcho(), busy.Addr().String(), zap.NewNop())
 	}()
 
 	select {
 	case err := <-done:
-		require.Error(t, err)
+		var opErr *net.OpError
+		require.ErrorAs(t, err, &opErr)
+		require.Equal(t, "listen", opErr.Op)
+		require.NotErrorIs(t, err, http.ErrServerClosed)
 	case <-time.After(15 * time.Second):
 		t.Fatal("runServer hung on a busy address instead of returning the start error")
 	}
 }
 
-// waitServing blocks until the server answers a request. A non nil ListenerAddr is not enough here:
-// echo opens the listener before entering Serve, so shutting down on it would test another path.
-func waitServing(t *testing.T, e *echo.Echo) {
+// newTestEcho builds a server that does not write to the test output.
+func newTestEcho() *echo.Echo {
+	var e = echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+
+	return e
+}
+
+// requireServing blocks until the server answers a request and returns the address it listens on.
+// A non nil ListenerAddr is not enough here: echo opens the listener before entering Serve, so
+// shutting down on it would test another path.
+func requireServing(t *testing.T, e *echo.Echo) string {
 	t.Helper()
 
-	var (
-		client   = http.Client{Timeout: time.Second}
-		deadline = time.Now().Add(15 * time.Second)
-	)
+	// a dedicated transport, so a kept alive connection neither delays the shutdown below
+	// nor survives into another test run
+	var client = http.Client{
+		Timeout:   time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 
+	var deadline = time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var addr = e.ListenerAddr()
 		if addr == nil {
@@ -94,8 +112,10 @@ func waitServing(t *testing.T, e *echo.Echo) {
 
 		require.NoError(t, res.Body.Close())
 
-		return
+		return addr.String()
 	}
 
 	t.Fatal("the server did not start serving")
+
+	return ""
 }

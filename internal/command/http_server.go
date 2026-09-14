@@ -46,8 +46,10 @@ func NewHTTPServer(ctn di.Container) *cobra.Command {
 			}
 
 			return ctn.Call(func(serverNames []string, cfg *viper.Viper, logger *zap.Logger) error {
-				// resolve every server before starting any of them: the container is not safe for
-				// concurrent resolution, and a failure here must not leave a started server behind
+				// resolve every server before starting any of them: the container caches shared
+				// definitions with a check-then-set, so resolving one definition from two
+				// goroutines closes its ready channel twice, and a failure here must not leave
+				// an already started server behind
 				var servers = make([]server, 0, len(serverNames))
 				for _, srvName := range serverNames {
 					var e *echo.Echo
@@ -124,13 +126,18 @@ func runServer(ctx context.Context, e *echo.Echo, addr string, log *zap.Logger) 
 	var timeoutContext, cancel = context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	var shutdownErr = e.Shutdown(timeoutContext)
-
-	// join the serving goroutine, so it neither logs nor leaks after the command returns.
-	// Shutdown closes the listener, so Start has already returned by now.
-	if err := <-errCh; shutdownErr == nil && !errors.Is(err, http.ErrServerClosed) {
+	// a failed shutdown is reported as is, without joining the serving goroutine below: the
+	// listener may still be open, and echo.Shutdown gives up on the plain server whenever the
+	// TLS one fails, so the join would block until the process is killed
+	if err := e.Shutdown(timeoutContext); err != nil {
 		return err
 	}
 
-	return shutdownErr
+	// join the serving goroutine, so it neither logs nor leaks after the command returns.
+	// Shutdown closed the listener, so Start has already returned by now.
+	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+
+	return nil
 }
