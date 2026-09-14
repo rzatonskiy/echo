@@ -27,6 +27,13 @@ const (
 	tagServerName = "echo.server_name"
 )
 
+// server is a resolved http server, ready to be run.
+type server struct {
+	echo *echo.Echo
+	addr string
+	log  *zap.Logger
+}
+
 // NewHTTPServer is command constructor.
 func NewHTTPServer(ctn di.Container) *cobra.Command {
 	return &cobra.Command{
@@ -39,28 +46,37 @@ func NewHTTPServer(ctn di.Container) *cobra.Command {
 			}
 
 			return ctn.Call(func(serverNames []string, cfg *viper.Viper, logger *zap.Logger) error {
-				var wg, ctx = errgroup.WithContext(cmd.Context())
-
+				// resolve every server before starting any of them: the container is not safe for
+				// concurrent resolution, and a failure here must not leave a started server behind
+				var servers = make([]server, 0, len(serverNames))
 				for _, srvName := range serverNames {
-					wg.Go(func() error {
-						var e *echo.Echo
-						if err := ctn.Resolve(&e, di.WithTags(tagEcho+"."+srvName)); err != nil {
-							return err
-						}
+					var e *echo.Echo
+					if err := ctn.Resolve(&e, di.WithTags(tagEcho+"."+srvName)); err != nil {
+						return err
+					}
 
-						var (
-							subCfg = cfg.Sub("echo." + srvName)
-							addr   = net.JoinHostPort(
-								subCfg.GetString("host"),
-								subCfg.GetString("port"),
-							)
-							log = logger.With(
-								zap.String("name", srvName),
-								zap.String("addr", addr),
-							)
+					var (
+						subCfg = cfg.Sub("echo." + srvName)
+						addr   = net.JoinHostPort(
+							subCfg.GetString("host"),
+							subCfg.GetString("port"),
 						)
+					)
 
-						return runServer(ctx, e, addr, log)
+					servers = append(servers, server{
+						echo: e,
+						addr: addr,
+						log: logger.With(
+							zap.String("name", srvName),
+							zap.String("addr", addr),
+						),
+					})
+				}
+
+				var wg, ctx = errgroup.WithContext(cmd.Context())
+				for _, srv := range servers {
+					wg.Go(func() error {
+						return runServer(ctx, srv.echo, srv.addr, srv.log)
 					})
 				}
 
